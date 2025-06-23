@@ -1,26 +1,38 @@
-// File: pages/api/voice/count.ts
+// File: app/api/save-svg/route.ts
 
-import type { NextApiRequest, NextApiResponse } from 'next'
+// ① 이 라우트만 Node.js 런타임에서 실행되도록 설정
+export const runtime = 'nodejs';
 
-// 서버 메모리 상에 카운트를 보관합니다.
-// (프로덕션에서는 Redis/MySQL 등 외부 저장소를 쓰세요)
-let totalCount = 0
+import { NextResponse } from 'next/server';
+import { promises as fs } from 'fs';
+import path from 'path';
 
-export default function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (req.method === 'POST') {
-    const { spoke } = req.body as { spoke?: boolean }
-    if (typeof spoke !== 'boolean') {
-      return res.status(400).json({ error: 'Invalid payload: spoke must be boolean' })
-    }
-    // 무음 → 발화 전환 시 클라이언트에서 spoke=true 로 호출해 줍니다.
-    if (spoke) totalCount++
-    return res.status(200).json({ count: totalCount })
+export async function POST(request: Request) {
+  const body = await request.json();
+  if (typeof body.svg !== 'string') {
+    return NextResponse.json(
+      { success: false, error: 'Invalid payload' },
+      { status: 400 }
+    );
   }
 
-  if (req.method === 'GET') {
-    return res.status(200).json({ count: totalCount })
-  }
+  const svg = body.svg;
+  const dir  = path.join(process.cwd(), 'public', 'saved-svgs');
+  const name = `pitch-${Date.now()}.svg`;
+  const file = path.join(dir, name);
 
-  res.setHeader('Allow', ['GET', 'POST'])
-  return res.status(405).end(`Method ${req.method} Not Allowed`)
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(file, svg, 'utf-8');
+    return NextResponse.json(
+      { success: true, file: `/saved-svgs/${name}` },
+      { status: 200 }
+    );
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json(
+      { success: false },
+      { status: 500 }
+    );
+  }
 }
