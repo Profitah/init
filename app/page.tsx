@@ -1,102 +1,142 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useRef, useState, useEffect } from 'react';
 
-export default function VoiceCounter() {
-  const [count, setCount] = useState(0);
-  const [error, setError] = useState<string | null>(null);
+export default function AudioPitchHistory() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const dataRef = useRef<Float32Array | null>(null);
+  const animRef = useRef<number | null>(null);
+  const [streaming, setStreaming] = useState(false);
 
-  const ctxRef = useRef<AudioContext | null>(null);
-  const nodeRef = useRef<AudioWorkletNode | null>(null);
-  const speakingRef = useRef(false);
+  // 과거 피치 기록 (픽셀 단위)
+  const pitchHistoryRef = useRef<number[]>([]);
 
-  async function handleStart() {
-    if (ctxRef.current) return;            // 이미 실행 중
-    setError(null);
+  // 간단한 auto-correlation 기반 피치 검출
+  function autoCorrelate(buffer: Float32Array, sampleRate: number): number {
+    const SIZE = buffer.length;
+    let bestOffset = -1;
+    let bestCorr = 0;
+    const rms = Math.sqrt(buffer.reduce((sum, v) => sum + v * v, 0) / SIZE);
+    if (rms < 0.01) return -1; // 소음 레벨 이하
 
-    /* 1) 지원 여부 확인 */
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError(
-        '이 브라우저(또는 HTTP 프로토콜)에서는 마이크를 사용할 수 없습니다.\n' +
-        'HTTPS 로 접속하거나 최신 브라우저를 사용하세요.',
-      );
-      return;
+    for (let offset = 64; offset < SIZE / 2; offset++) {
+      let corr = 0;
+      for (let i = 0; i < SIZE - offset; i++) {
+        corr += buffer[i] * buffer[i + offset];
+      }
+      if (corr > bestCorr) {
+        bestCorr = corr;
+        bestOffset = offset;
+      }
     }
-
-    try {
-      /* 2) 권한 요청 */
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      /* 3) 오디오 컨텍스트 + Worklet 구성 */
-      const ctx = new AudioContext({ sampleRate: 48_000 });
-      if (ctx.state === 'suspended') await ctx.resume(); // Safari 대비
-
-      /* public/ 아래 정적 파일은 /mic-processor.js 로 접근 */
-      await ctx.audioWorklet.addModule('/mic-processor.js');
-
-      const source = ctx.createMediaStreamSource(stream);
-      const node   = new AudioWorkletNode(ctx, 'mic-processor');
-
-      node.port.onmessage = (e) => {
-        const spoke = Boolean(e.data);      // 1 = 발화 감지
-        if (spoke && !speakingRef.current) {
-          setCount((c) => c + 1);           // 무음 → 발화 시 카운트++
-          speakingRef.current = true;
-        }
-        if (!spoke && speakingRef.current) {
-          speakingRef.current = false;      // 발화 끝
-        }
-      };
-
-      source.connect(node).connect(ctx.destination);
-
-      ctxRef.current  = ctx;
-      nodeRef.current = node;
-    } catch (err: any) {
-      console.error(err);
-      setError(
-        err.name === 'NotAllowedError'
-          ? '마이크 접근이 차단되었습니다. 브라우저 권한을 허용해 주세요.'
-          : `마이크 오류: ${err.message || '알 수 없음'}`,
-      );
-    }
+    if (bestOffset === -1) return -1;
+    return sampleRate / bestOffset;
   }
 
-  function handleStop() {
-    nodeRef.current?.disconnect();
-    ctxRef.current?.close();
-    nodeRef.current = null;
-    ctxRef.current  = null;
-    speakingRef.current = false;
-  }
+  const handleStart = async () => {
+    if (streaming) return;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const ctx = new AudioContext();
+    if (ctx.state === 'suspended') await ctx.resume();
+
+    // 고역 필터로 저주파 잡음 제거
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'highpass';
+    filter.frequency.value = 80;
+
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 4096;                       // 해상도 증가
+    analyser.smoothingTimeConstant = 0.8;          // 데이터 부드럽게
+
+    const bufferLen = analyser.fftSize;
+    dataRef.current = new Float32Array(bufferLen);
+
+    const src = ctx.createMediaStreamSource(stream);
+    src.connect(filter).connect(analyser);
+
+    audioCtxRef.current = ctx;
+    analyserRef.current = analyser;
+    setStreaming(true);
+    draw();
+  };
+
+  const handleStop = () => {
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+    audioCtxRef.current?.close();
+    audioCtxRef.current = null;
+    analyserRef.current = null;
+    pitchHistoryRef.current = [];
+    setStreaming(false);
+  };
+
+  const draw = () => {
+    const canvas = canvasRef.current!;
+    const ctx = canvas.getContext('2d')!;
+    const analyser = analyserRef.current!;
+    const data = dataRef.current!;
+
+    const w = canvas.width;
+    const h = canvas.height;
+
+    // 시간영역 데이터 가져와서 피치 검출
+    analyser.getFloatTimeDomainData(data);
+    const pitch = autoCorrelate(data, audioCtxRef.current!.sampleRate);
+    const hist = pitchHistoryRef.current;
+    hist.push(pitch > 0 ? pitch : 0);
+    if (hist.length > w) hist.shift();
+
+    // 캔버스 클리어
+    ctx.clearRect(0, 0, w, h);
+
+    // 피치 히스토리 그리기
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'red';
+    ctx.beginPath();
+    hist.forEach((val, i) => {
+      // 50Hz~1000Hz 범위 맵핑
+      const y = h - Math.min(Math.max((val - 50) / 950, 0), 1) * h;
+      if (i === 0) ctx.moveTo(i, y);
+      else         ctx.lineTo(i, y);
+    });
+    ctx.stroke();
+
+    animRef.current = requestAnimationFrame(draw);
+  };
+
+  // 언마운트 시 정리
+  useEffect(() => {
+    return () => {
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+      audioCtxRef.current?.close();
+    };
+  }, []);
 
   return (
-    <main style={{ padding: '2rem', textAlign: 'center' }}>
-      <h1 style={{ fontSize: '2rem', marginBottom: '1rem' }}>
-        🗣️ 말한 횟수: {count}
-      </h1>
-
+    <div style={{ textAlign: 'center', padding: '2rem' }}>
+      <h1>🎙️ 실시간 피치 히스토리 </h1>
+      <canvas
+        ref={canvasRef}
+        width={600}
+        height={200}
+        style={{
+          border: '1px solid #ccc',
+          borderRadius: 4,
+          display: 'block',
+          margin: '1rem auto'
+        }}
+      />
       <button
         onClick={handleStart}
-        disabled={!!ctxRef.current}
-        style={{ padding: '0.5rem 1.5rem', marginRight: '1rem' }}
+        disabled={streaming}
+        style={{ marginRight: '1rem' }}
       >
-        마이크 시작
+        시작
       </button>
-
-      <button
-        onClick={handleStop}
-        disabled={!ctxRef.current}
-        style={{ padding: '0.5rem 1.5rem' }}
-      >
+      <button onClick={handleStop} disabled={!streaming}>
         중지
       </button>
-
-      {error && (
-        <p style={{ color: 'red', marginTop: '1rem', whiteSpace: 'pre-line' }}>
-          {error}
-        </p>
-      )}
-    </main>
+    </div>
   );
 }
