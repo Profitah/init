@@ -16,8 +16,7 @@ export default function AudioPitchWithCaptionSVG() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const bufRef      = useRef<Float32Array | null>(null);
 
-  // 타이밍 refs
-  const startRef    = useRef(0);
+  // requestAnimationFrame ref
   const rafRef      = useRef(0);
 
   // 캡션 인덱스
@@ -76,23 +75,23 @@ export default function AudioPitchWithCaptionSVG() {
 
   /* ---------- tickAudio ---------- */
   const tickAudio = () => {
-    const ctx = audioCtxRef.current!;
     const analyser = analyserRef.current!;
     const buf = bufRef.current!;
 
-    const now = ctx.currentTime - startRef.current;
+    // 비디오 현재 시간으로 동기화
+    const now = playRef.current?.getCurrentTime() ?? 0;
 
     // 캡션 동기화
     const capIdx = caps.findIndex(c => now >= c.startTime && now <= c.endTime);
     if (capIdx !== curIdxRef.current) {
       curIdxRef.current = capIdx;
       setCurCap(capIdx >= 0 ? caps[capIdx] : null);
-      setUserPts([]);             // 구간 바뀔 때 초기화
+      setUserPts([]);  // 구간 바뀔 때 그래프 초기화
     }
 
     // 사용자 피치 수집
     analyser.getFloatTimeDomainData(buf);
-    const p = autoCorrelate(buf, ctx.sampleRate);
+    const p = autoCorrelate(buf, analyser.context.sampleRate);
     setUserPts(u => {
       const next = [...u, p > 0 ? p : 0];
       return next.length > 1000 ? next.slice(-1000) : next;
@@ -124,7 +123,6 @@ export default function AudioPitchWithCaptionSVG() {
     audioCtxRef.current = ctx;
     analyserRef.current = analyser;
     bufRef.current      = buf;
-    startRef.current    = ctx.currentTime;
     setUserPts([]);
 
     rafRef.current = requestAnimationFrame(tickAudio);
