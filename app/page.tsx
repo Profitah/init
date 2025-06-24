@@ -1,7 +1,7 @@
 'use client';
 
 import { useRef, useEffect, useState } from 'react';
-import YouTube from 'react-youtube';
+import YouTube, { YouTubeEvent } from 'react-youtube';
 
 /* ---------- 타입 ---------- */
 interface PitchPoint  { time_sec: number; pitch_hz: number; }
@@ -18,19 +18,17 @@ export default function AudioPitchWithCaptionSVG() {
 
   // 타이밍 refs
   const startRef    = useRef(0);
-  const lastIdxRef  = useRef(-1);
   const rafRef      = useRef(0);
 
   // 캡션 인덱스
   const curIdxRef   = useRef<number>(-1);
 
-  /* ---------- 데이터 refs ---------- */
-  const userPtsRef  = useRef<number[]>([]);
-
   /* ---------- state ---------- */
   const [defPts,  setDefPts]  = useState<PitchPoint[]>([]);
   const [caps,    setCaps]    = useState<CaptionLine[]>([]);
   const [curCap,  setCurCap]  = useState<CaptionLine | null>(null);
+  const [userPts, setUserPts] = useState<number[]>([]);
+  const [ended,   setEnded]   = useState(false);
 
   /* ---------- constants ---------- */
   const W = 800, H = 220;
@@ -76,7 +74,7 @@ export default function AudioPitchWithCaptionSVG() {
     return best > 0 ? sr / best : -1;
   }
 
-  /* ---------- tickAudio (클로저) ---------- */
+  /* ---------- tickAudio ---------- */
   const tickAudio = () => {
     const ctx = audioCtxRef.current!;
     const analyser = analyserRef.current!;
@@ -89,41 +87,23 @@ export default function AudioPitchWithCaptionSVG() {
     if (capIdx !== curIdxRef.current) {
       curIdxRef.current = capIdx;
       setCurCap(capIdx >= 0 ? caps[capIdx] : null);
-
-      // 새 구간 시작 → 이전 데이터 전부 삭제
-      userPtsRef.current = [];
-      lastIdxRef.current = -1;
+      setUserPts([]);             // 구간 바뀔 때 초기화
     }
 
-    // 사용자 피치 수집 & 윈도우에 추가
+    // 사용자 피치 수집
     analyser.getFloatTimeDomainData(buf);
     const p = autoCorrelate(buf, ctx.sampleRate);
-    userPtsRef.current.push(p > 0 ? p : 0);
-    // 최근 1000프레임만 유지
-    if (userPtsRef.current.length > 1000) {
-      userPtsRef.current.shift();
-    }
-
-    // SVG polyline 업데이트
-    const segStart = curCap?.startTime ?? 0;
-    const nextStart = caps[curIdxRef.current + 1]?.startTime;
-    const segEnd = nextStart ?? curCap?.endTime ?? 1;
-    const defSeg = defPts.filter(p => p.time_sec >= segStart && p.time_sec <= segEnd);
-    const maxPitch = Math.max(...defSeg.map(p=>p.pitch_hz), ...userPtsRef.current, 1);
-
-    const userLine = svgRef.current!.querySelector<SVGPolylineElement>('.user-line');
-    if (userLine) {
-      const pts = buildLine(userPtsRef.current, true, segStart, segEnd, maxPitch);
-      userLine.setAttribute('points', pts);
-    }
+    setUserPts(u => {
+      const next = [...u, p > 0 ? p : 0];
+      return next.length > 1000 ? next.slice(-1000) : next;
+    });
 
     rafRef.current = requestAnimationFrame(tickAudio);
   };
 
-  /* ---------- 시작/재시작 ---------- */
-  const startAll = async () => {
-    playRef.current?.playVideo?.();
-
+  /* ---------- 마이크 시작/재개 ---------- */
+  const startMic = async () => {
+    if (ended) return;
     if (audioCtxRef.current) {
       if (audioCtxRef.current.state === 'suspended') {
         await audioCtxRef.current.resume();
@@ -131,7 +111,6 @@ export default function AudioPitchWithCaptionSVG() {
       }
       return;
     }
-
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const ctx = new AudioContext();
     if (ctx.state === 'suspended') await ctx.resume();
@@ -142,22 +121,32 @@ export default function AudioPitchWithCaptionSVG() {
     const buf = new Float32Array(analyser.fftSize);
 
     ctx.createMediaStreamSource(stream).connect(analyser);
-
     audioCtxRef.current = ctx;
     analyserRef.current = analyser;
     bufRef.current      = buf;
     startRef.current    = ctx.currentTime;
-    userPtsRef.current  = [];
+    setUserPts([]);
 
     rafRef.current = requestAnimationFrame(tickAudio);
   };
 
-  /* ---------- 중지 = 일시정지 ---------- */
-  const stopAll = async () => {
-    playRef.current?.pauseVideo?.();
+  /* ---------- 마이크 일시정지 ---------- */
+  const stopMic = async () => {
     if (!audioCtxRef.current) return;
     cancelAnimationFrame(rafRef.current);
     await audioCtxRef.current.suspend();
+  };
+
+  /* ---------- 영상 재생/일시정지/종료 동기화 ---------- */
+  const onPlayerStateChange = (e: YouTubeEvent) => {
+    if (e.data === 1) {         // playing
+      startMic();
+    } else if (e.data === 2) {  // paused
+      stopMic();
+    } else if (e.data === 0) {  // ended
+      setEnded(true);
+      stopMic();
+    }
   };
 
   /* ---------- YouTube 준비 ---------- */
@@ -165,7 +154,7 @@ export default function AudioPitchWithCaptionSVG() {
     playRef.current = e.target;
   };
 
-  /* ---------- polyline 생성 함수 ---------- */
+  /* ---------- polyline 생성 ---------- */
   function buildLine(
     src: (PitchPoint|number)[],
     isUser: boolean,
@@ -179,19 +168,26 @@ export default function AudioPitchWithCaptionSVG() {
       const t = isUser
         ? sStart + i * frameDurRef.current
         : (v as PitchPoint).time_sec;
-      const x = ((t - sStart)/dur) * W;
-      const y = H - Math.min(pitch/maxP,1) * H;
+      const x = ((t - sStart)/dur)*W;
+      const y = H - Math.min(pitch/maxP,1)*H;
       return `${x},${y}`;
     }).join(' ');
   }
 
   /* ---------- 렌더링 ---------- */
+  const segStart = curCap?.startTime ?? 0;
+  const nextStart = caps[curIdxRef.current + 1]?.startTime;
+  const segEnd = nextStart ?? curCap?.endTime ?? 1;
+  const defSeg = defPts.filter(p => p.time_sec >= segStart && p.time_sec <= segEnd);
+  const maxPitch = Math.max(...defSeg.map(p=>p.pitch_hz), ...userPts, 1);
+
   return (
     <div style={{ padding:'2rem', textAlign:'center', color:'#fff' }}>
       <h2>🎙️ 대사·침묵 구간별 실시간 피치</h2>
       <YouTube
         videoId={VIDEO_ID}
         onReady={onPlayerReady}
+        onStateChange={onPlayerStateChange}
         opts={{ playerVars:{ playsinline:1, controls:1 } }}
       />
       <svg
@@ -203,15 +199,9 @@ export default function AudioPitchWithCaptionSVG() {
         }}
       >
         {/* 기준 피치 (파랑) */}
-        {defPts.length > 1 && curCap && (
+        {defSeg.length > 1 && (
           <polyline
-            points={buildLine(
-              defPts.filter(p => p.time_sec >= curCap.startTime && p.time_sec <= (caps[curIdxRef.current+1]?.startTime ?? curCap.endTime)),
-              false,
-              curCap.startTime,
-              (caps[curIdxRef.current+1]?.startTime ?? curCap.endTime),
-              Math.max(1, ...defPts.map(p=>p.pitch_hz))
-            )}
+            points={buildLine(defSeg,false,segStart,segEnd,maxPitch)}
             fill="none"
             stroke="deepskyblue"
             strokeWidth={2}
@@ -219,11 +209,10 @@ export default function AudioPitchWithCaptionSVG() {
         )}
         {/* 사용자 피치 (빨강) */}
         <polyline
-          className="user-line"
+          points={buildLine(userPts,true,segStart,segEnd,maxPitch)}
           fill="none"
           stroke="tomato"
           strokeWidth={2}
-          points=""
         />
       </svg>
       <div style={{
@@ -233,8 +222,12 @@ export default function AudioPitchWithCaptionSVG() {
         {curCap?.script ?? ''}
       </div>
       <div style={{ marginTop:'1rem' }}>
-        <button onClick={startAll} style={{ marginRight:'1rem' }}>시작</button>
-        <button onClick={stopAll}>중지</button>
+        <button onClick={() => playRef.current.playVideo()} style={{ marginRight:'1rem' }} disabled={ended}>
+          재생
+        </button>
+        <button onClick={() => playRef.current.pauseVideo()} disabled={ended}>
+          일시정지
+        </button>
       </div>
     </div>
   );
